@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/kenzo0107/sendgrid"
 	"github.com/kenzo0107/terraform-provider-sendgrid/flex"
 )
@@ -192,25 +193,37 @@ type ssoTeammateResourceModel struct {
 	SubuserAccess []ssoSubuserAccessResourceModel `tfsdk:"subuser_access"`
 }
 
-// isForbidden reports whether err is an HTTP 403 response from SendGrid.
-func isForbidden(err error) bool {
+// isSubuserAccessForbidden reports whether err is the 403 that GET /v3/teammates/{name}/subuser_access
+// returns to accounts that cannot use Subusers (for example, a Subuser account itself).
+// SendGrid returns {"message": "..."} for it, which the client turns into an error carrying the HTTP
+// status code. Other 403 responses that come back as {"errors": [...]} are plain errors without a status
+// code, so they are not matched and keep failing as before.
+func isSubuserAccessForbidden(err error) bool {
 	var sc interface{ HTTPStatusCode() int }
 	return errors.As(err, &sc) && sc.HTTPStatusCode() == http.StatusForbidden
 }
 
 // getTeammateSubuserAccess reads the Subuser access of a teammate.
-// Accounts that cannot use Subusers (for example, a Subuser account itself) or API keys without
-// Subuser scopes get 403 from this endpoint. When the resource does not manage subuser_access,
-// such a 403 is treated as "no Subuser access" so that teammates can still be read.
-func (r *ssoTeammateResource) getTeammateSubuserAccess(ctx context.Context, email string, managesSubuserAccess bool) (*sendgrid.OutputGetTeammateSubuserAccess, error) {
-	sa, err := r.client.GetTeammateSubuserAccess(ctx, email, &sendgrid.InputGetTeammateSubuserAccess{Username: email})
+// When the resource does not manage subuser_access and the account cannot read it
+// (see isSubuserAccessForbidden), it returns an empty result and skipped=true instead of an error,
+// so that teammates can still be read and imported.
+func (r *ssoTeammateResource) getTeammateSubuserAccess(ctx context.Context, email string, managesSubuserAccess bool) (sa *sendgrid.OutputGetTeammateSubuserAccess, skipped bool, err error) {
+	sa, err = r.client.GetTeammateSubuserAccess(ctx, email, &sendgrid.InputGetTeammateSubuserAccess{Username: email})
 	if err != nil {
-		if !managesSubuserAccess && isForbidden(err) {
-			return &sendgrid.OutputGetTeammateSubuserAccess{}, nil
+		if !managesSubuserAccess && isSubuserAccessForbidden(err) {
+			return &sendgrid.OutputGetTeammateSubuserAccess{}, true, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
-	return sa, nil
+	return sa, false, nil
+}
+
+// subuserAccessSkippedWarning is shown when getTeammateSubuserAccess skipped a 403.
+func subuserAccessSkippedWarning(email string) (string, string) {
+	return "SSO teammate subuser access was not read",
+		fmt.Sprintf("SendGrid returned 403 Forbidden for the subuser access of %q, so it was treated as having no subuser access. "+
+			"If this teammate has subuser access, the state does not reflect it. "+
+			"This happens on accounts that cannot use Subusers, such as a Subuser account.", email)
 }
 
 func (r *ssoTeammateResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -463,7 +476,7 @@ func (r *ssoTeammateResource) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 
-	sa, err := r.getTeammateSubuserAccess(ctx, email, len(data.SubuserAccess) > 0)
+	sa, skipped, err := r.getTeammateSubuserAccess(ctx, email, len(data.SubuserAccess) > 0)
 
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -471,6 +484,10 @@ func (r *ssoTeammateResource) Read(ctx context.Context, req resource.ReadRequest
 			fmt.Sprintf("Unable to read SSO teammate subuser access, got error: %s", err),
 		)
 		return
+	}
+	if skipped {
+		summary, detail := subuserAccessSkippedWarning(email)
+		tflog.Warn(ctx, summary+": "+detail)
 	}
 
 	scopes := []types.String{}
@@ -644,7 +661,7 @@ func (r *ssoTeammateResource) ImportState(ctx context.Context, req resource.Impo
 		return
 	}
 
-	sa, err := r.getTeammateSubuserAccess(ctx, email, false)
+	sa, skipped, err := r.getTeammateSubuserAccess(ctx, email, false)
 
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -652,6 +669,9 @@ func (r *ssoTeammateResource) ImportState(ctx context.Context, req resource.Impo
 			fmt.Sprintf("Unable to read SSO teammate subuser access, got error: %s", err),
 		)
 		return
+	}
+	if skipped {
+		resp.Diagnostics.AddWarning(subuserAccessSkippedWarning(email))
 	}
 
 	scopes := []types.String{}
