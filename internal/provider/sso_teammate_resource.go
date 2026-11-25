@@ -5,7 +5,9 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -188,6 +190,27 @@ type ssoTeammateResourceModel struct {
 	FirstName     types.String                    `tfsdk:"first_name"`
 	LastName      types.String                    `tfsdk:"last_name"`
 	SubuserAccess []ssoSubuserAccessResourceModel `tfsdk:"subuser_access"`
+}
+
+// isForbidden reports whether err is an HTTP 403 response from SendGrid.
+func isForbidden(err error) bool {
+	var sc interface{ HTTPStatusCode() int }
+	return errors.As(err, &sc) && sc.HTTPStatusCode() == http.StatusForbidden
+}
+
+// getTeammateSubuserAccess reads the Subuser access of a teammate.
+// Accounts that cannot use Subusers (for example, a Subuser account itself) or API keys without
+// Subuser scopes get 403 from this endpoint. When the resource does not manage subuser_access,
+// such a 403 is treated as "no Subuser access" so that teammates can still be read.
+func (r *ssoTeammateResource) getTeammateSubuserAccess(ctx context.Context, email string, managesSubuserAccess bool) (*sendgrid.OutputGetTeammateSubuserAccess, error) {
+	sa, err := r.client.GetTeammateSubuserAccess(ctx, email, &sendgrid.InputGetTeammateSubuserAccess{Username: email})
+	if err != nil {
+		if !managesSubuserAccess && isForbidden(err) {
+			return &sendgrid.OutputGetTeammateSubuserAccess{}, nil
+		}
+		return nil, err
+	}
+	return sa, nil
 }
 
 func (r *ssoTeammateResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -440,13 +463,7 @@ func (r *ssoTeammateResource) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 
-	sa, err := r.client.GetTeammateSubuserAccess(
-		ctx,
-		email,
-		&sendgrid.InputGetTeammateSubuserAccess{
-			Username: email,
-		},
-	)
+	sa, err := r.getTeammateSubuserAccess(ctx, email, len(data.SubuserAccess) > 0)
 
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -627,13 +644,7 @@ func (r *ssoTeammateResource) ImportState(ctx context.Context, req resource.Impo
 		return
 	}
 
-	sa, err := r.client.GetTeammateSubuserAccess(
-		ctx,
-		email,
-		&sendgrid.InputGetTeammateSubuserAccess{
-			Username: email,
-		},
-	)
+	sa, err := r.getTeammateSubuserAccess(ctx, email, false)
 
 	if err != nil {
 		resp.Diagnostics.AddError(
